@@ -1,0 +1,273 @@
+name: Omega Quant Lab — Pipeline
+
+on:
+  # Ejecución manual con parámetros
+  workflow_dispatch:
+    inputs:
+      timeframe:
+        description: "Timeframe (1m/3m/5m/15m/1h)"
+        required: true
+        default: "5m"
+        type: choice
+        options: ["1m", "3m", "5m", "15m", "1h"]
+      limit:
+        description: "Velas por activo"
+        required: true
+        default: "5000"
+      symbols:
+        description: "Símbolos separados por espacio (vacío = lista por defecto)"
+        required: false
+        default: ""
+      mc_iter:
+        description: "Iteraciones Monte Carlo"
+        required: true
+        default: "10000"
+
+  # Ejecución programada (diaria 02:00 UTC)
+  schedule:
+    - cron: "0 2 * * *"
+
+  # En push a main, solo lint + smoke test
+  push:
+    branches: [main, master]
+    paths:
+      - "omega/**"
+      - ".github/workflows/omega.yml"
+      - "signal_engine.py"
+      - "backtest_engine.py"
+      - "core_engine.py"
+      - "data_engine.py"
+      - "config.py"
+
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  # ------------------------------------------------------------------
+  # Job 1: lint + smoke (rápido, siempre corre)
+  # ------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff==0.6.9
+
+      - name: Ruff (solo errores críticos)
+        run: |
+          ruff check . --select E9,F --output-format=github || true
+
+      - name: Compilar todo el paquete
+        run: |
+          python -m compileall -q omega || true
+          python -m compileall -q .
+
+  # ------------------------------------------------------------------
+  # Job 2: pipeline completo (solo en schedule / dispatch)
+  # ------------------------------------------------------------------
+  pipeline:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        timeframe: ["5m"]           # ajustar si querés más TFs
+        # Si querés correr varios TFs en paralelo: ["1m","5m","15m","1h"]
+    concurrency:
+      group: omega-pipeline-${{ matrix.timeframe }}
+      cancel-in-progress: false
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      OMEGA_TIMEFRAME: ${{ github.event.inputs.timeframe || matrix.timeframe }}
+      OMEGA_LIMIT: ${{ github.event.inputs.limit || '5000' }}
+      OMEGA_MC_ITER: ${{ github.event.inputs.mc_iter || '10000' }}
+      OMEGA_SYMBOLS: ${{ github.event.inputs.symbols || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Instalar dependencias del sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential
+
+      - name: Instalar dependencias Python
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          pip install -r requirements.txt
+          pip install lightgbm==4.5.0 scikit-learn==1.5.2 optuna==4.0.0
+
+      - name: Preparar árbol de paquetes
+        run: |
+          # Asegura que omega/ sea importable como paquete
+          touch omega/__init__.py
+          python -c "import sys; print(sys.version); import ccxt, pandas, numpy; print('deps OK')"
+
+      - name: Ejecutar pipeline OMEGA
+        id: pipeline
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          ARGS="--timeframe ${OMEGA_TIMEFRAME} --limit ${OMEGA_LIMIT} --mc-iter ${OMEGA_MC_ITER} --out artifacts"
+          if [ -n "$OMEGA_SYMBOLS" ]; then
+            ARGS="$ARGS --symbols $OMEGA_SYMBOLS"
+          fi
+          echo "Ejecutando: python -m omega.run_full $ARGS"
+          python -m omega.run_full $ARGS 2>&1 | tee artifacts/pipeline.log
+
+      - name: Resumen en el job summary
+        if: always()
+        run: |
+          {
+            echo "## Omega Quant Lab — resumen"
+            echo ""
+            echo "- Timeframe: \`${OMEGA_TIMEFRAME}\`"
+            echo "- Límite de velas: \`${OMEGA_LIMIT}\`"
+            echo "- Iteraciones Monte Carlo: \`${OMEGA_MC_ITER}\`"
+            echo ""
+            if [ -f artifacts/pipeline_summary.json ]; then
+              echo "### Estado"
+              echo '```json'
+              python - <<'PY'
+import json, pathlib
+p = pathlib.Path("artifacts/pipeline_summary.json")
+if p.exists():
+    d = json.loads(p.read_text())
+    print(json.dumps({
+        "status": d.get("status"),
+        "started": d.get("started_utc"),
+        "finished": d.get("finished_utc"),
+        "stages": {k: (v if not isinstance(v, list) else f"{len(v)} items")
+                   for k, v in d.get("stages", {}).items()},
+    }, indent=2))
+PY
+              echo '```'
+            fi
+            if [ -f artifacts/metrics_comparison.csv ]; then
+              echo ""
+              echo "### Métricas comparadas"
+              echo '```'
+              cat artifacts/metrics_comparison.csv
+              echo '```'
+            fi
+            if [ -f artifacts/certification.csv ]; then
+              echo ""
+              echo "### Certificación"
+              echo '```'
+              cat artifacts/certification.csv
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Subir artifact — bundle completo
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: omega-${{ env.OMEGA_TIMEFRAME }}-${{ github.run_number }}
+          path: |
+            artifacts/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Subir artifact — señales (acceso rápido)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: omega-signals-${{ env.OMEGA_TIMEFRAME }}-${{ github.run_number }}
+          path: |
+            artifacts/signals.json
+            artifacts/signals.csv
+            artifacts/signals_report.md
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Subir artifact — reportes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: omega-reports-${{ env.OMEGA_TIMEFRAME }}-${{ github.run_number }}
+          path: |
+            artifacts/pipeline_summary.json
+            artifacts/metrics_comparison.csv
+            artifacts/certification.csv
+            artifacts/monte_carlo.json
+            artifacts/validator_reports.json
+            artifacts/similarity.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Fallar si el pipeline falló
+        if: always()
+        run: |
+          if [ -f artifacts/pipeline_summary.json ]; then
+            status=$(python -c "import json;print(json.load(open('artifacts/pipeline_summary.json')).get('status','unknown'))")
+            echo "Pipeline status: $status"
+            if [ "$status" != "ok" ]; then
+              exit 1
+            fi
+          else
+            echo "No se generó pipeline_summary.json"
+            exit 1
+          fi
+
+  # ------------------------------------------------------------------
+  # Job 3: release opcional — publica artifacts como release
+  # ------------------------------------------------------------------
+  release:
+    if: github.event_name == 'workflow_dispatch' && success()
+    needs: pipeline
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Descargar artifacts del pipeline
+        uses: actions/download-artifact@v4
+        with:
+          pattern: omega-*
+          merge-multiple: false
+          path: dist
+
+      - name: Empaquetar
+        run: |
+          mkdir -p release
+          find dist -type f -name "*" -exec cp --parents {} release/ \;
+          cd release && tar -czf ../omega-artifacts.tar.gz . && cd ..
+
+      - name: Crear release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: omega-${{ github.run_number }}
+          name: "Omega Quant Lab — run ${{ github.run_number }}"
+          body: |
+            Pipeline ejecutado manualmente.
+            Timeframe: ${{ github.event.inputs.timeframe }}
+            Límite: ${{ github.event.inputs.limit }}
+            MC iter: ${{ github.event.inputs.mc_iter }}
+          files: |
+            omega-artifacts.tar.gz
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
